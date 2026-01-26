@@ -70,6 +70,7 @@ const (
 	ActionQueueAdd    = "queue_add"
 	ActionQueueRemove = "queue_remove"
 	ActionQueueClear  = "queue_clear"
+	ActionSyncQueue   = "sync_queue"
 )
 
 // Message is the base message structure
@@ -140,11 +141,12 @@ type UserLeftPayload struct {
 
 // PlaybackActionPayload is for playback control actions
 type PlaybackActionPayload struct {
-	Action     string     `json:"action"`
-	TrackID    string     `json:"track_id,omitempty"`
-	Position   int64      `json:"position,omitempty"` // milliseconds
-	TrackInfo  *TrackInfo `json:"track_info,omitempty"`
-	InsertNext bool       `json:"insert_next,omitempty"`
+	Action     string      `json:"action"`
+	TrackID    string      `json:"track_id,omitempty"`
+	Position   int64       `json:"position,omitempty"` // milliseconds
+	TrackInfo  *TrackInfo  `json:"track_info,omitempty"`
+	InsertNext bool        `json:"insert_next,omitempty"`
+	Queue      []TrackInfo `json:"queue,omitempty"`
 }
 
 // Suggestion payloads
@@ -1499,6 +1501,40 @@ func (s *Server) handlePlaybackAction(c *Client, payload json.RawMessage) {
 
 	case ActionQueueClear:
 		room.State.Queue = []TrackInfo{}
+
+	case ActionSyncQueue:
+		if p.Queue == nil {
+			// Allow empty queue sync (clearing) but log it
+			room.State.Queue = []TrackInfo{}
+		} else {
+			// Limit queue size
+			if len(p.Queue) > MaxQueueSize {
+				p.Queue = p.Queue[:MaxQueueSize]
+			}
+
+			// Validate and sanitize each track in the queue
+			sanitizedQueue := make([]TrackInfo, 0, len(p.Queue))
+			for _, track := range p.Queue {
+				track.ID = sanitizeString(track.ID, 200)
+				track.Title = sanitizeString(track.Title, MaxTrackTitleLength)
+				track.Artist = sanitizeString(track.Artist, MaxTrackArtistLength)
+				track.Album = sanitizeString(track.Album, MaxTrackArtistLength)
+
+				// Skip invalid tracks
+				if track.ID == "" || track.Title == "" {
+					continue
+				}
+
+				if track.Duration <= 0 {
+					track.Duration = 180000 // Default to 3m
+				}
+
+				sanitizedQueue = append(sanitizedQueue, track)
+			}
+			room.State.Queue = sanitizedQueue
+			// Pass sanitized queue back to payload for broadcast
+			p.Queue = sanitizedQueue
+		}
 
 	default:
 		c.sendError(s.logger, "unknown_action", fmt.Sprintf("Unknown action: %s", p.Action))
