@@ -1175,6 +1175,21 @@ func (s *Server) handleApproveJoin(c *Client, payload json.RawMessage) {
 		State:        room.State,
 	})
 
+	// If there is a current track, immediately send buffer-complete + seek (+ play if host is playing)
+	if room.State.CurrentTrack != nil {
+		joiningClient.sendMessage(s.logger, MsgTypeBufferComplete, BufferCompletePayload{TrackID: room.State.CurrentTrack.ID})
+		joiningClient.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
+			Action:   ActionSeek,
+			Position: room.State.Position,
+		})
+		if room.State.IsPlaying {
+			joiningClient.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
+				Action:   ActionPlay,
+				Position: room.State.Position,
+			})
+		}
+	}
+
 	// Notify all other users
 	for _, client := range room.Clients {
 		if client != nil && client.ID != joiningClient.ID {
@@ -1322,37 +1337,38 @@ func (s *Server) handlePlaybackAction(c *Client, payload json.RawMessage) {
 		room.HostStartPosition = 0
 		s.logger.Debug("Track changed", zap.String("room_code", room.Code), zap.String("track_id", p.TrackInfo.ID))
 
-		// Initialize buffering for all users EXCEPT the host
-		room.BufferingUsers = make(map[string]bool)
-		waitingFor := make([]string, 0, len(room.Clients)-1)
-		for id := range room.Clients {
-			if id != c.ID {
-				room.BufferingUsers[id] = true
-				waitingFor = append(waitingFor, id)
-			}
-		}
+		// We do not require guests to wait for everyone to buffer.
+		// Immediately notify clients and sync them to position 0 so guests can proceed.
+		room.BufferingUsers = nil // disable per-room buffering tracking
 
-		// Broadcast track change
+		// Broadcast track change and immediate sync
 		for _, client := range room.Clients {
 			if client != nil {
 				// Send track change
 				client.sendMessage(s.logger, MsgTypeSyncPlayback, p)
 
-				// Ensure everyone is paused at position 0 during buffering
+				// Ensure everyone is paused at position 0 during transition
 				client.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 					Action:   ActionPause,
 					Position: 0,
 				})
 
-				if len(waitingFor) > 0 {
-					client.sendMessage(s.logger, MsgTypeBufferWait, BufferWaitPayload{
-						TrackID:    p.TrackInfo.ID,
-						WaitingFor: waitingFor,
-					})
-				} else {
-					// If no guests need to buffer, immediately notify
-					client.sendMessage(s.logger, MsgTypeBufferComplete, BufferCompletePayload{
-						TrackID: p.TrackInfo.ID,
+				// Immediately notify buffer complete so clients that wait for it will apply seek/play
+				client.sendMessage(s.logger, MsgTypeBufferComplete, BufferCompletePayload{
+					TrackID: p.TrackInfo.ID,
+				})
+
+				// Seek everyone to the new start position (0)
+				client.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
+					Action:   ActionSeek,
+					Position: 0,
+				})
+
+				// If the room was marked playing, start playback immediately
+				if room.State.IsPlaying {
+					client.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
+						Action:   ActionPlay,
+						Position: 0,
 					})
 				}
 			}
@@ -1451,6 +1467,24 @@ func (s *Server) handleBufferReady(c *Client, payload json.RawMessage) {
 
 	// Mark user as ready
 	delete(room.BufferingUsers, c.ID)
+
+	// If buffering is disabled for this room, respond per-client so late buffer_ready still receives SEEK/PLAY
+	if room.BufferingUsers == nil {
+		s.logger.Debug("Buffering disabled for room - per-client ACK", zap.String("room_code", room.Code), zap.String("user_id", c.ID))
+		// Send buffer-complete and sync to this specific client so they will apply seek/play
+		c.sendMessage(s.logger, MsgTypeBufferComplete, BufferCompletePayload{TrackID: p.TrackID})
+		c.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
+			Action:   ActionSeek,
+			Position: room.State.Position,
+		})
+		if room.State.IsPlaying {
+			c.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
+				Action:   ActionPlay,
+				Position: room.State.Position,
+			})
+		}
+		return
+	}
 
 	// Check if all users are ready
 	if len(room.BufferingUsers) == 0 {
