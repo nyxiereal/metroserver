@@ -71,6 +71,7 @@ const (
 	ActionQueueRemove = "queue_remove"
 	ActionQueueClear  = "queue_clear"
 	ActionSyncQueue   = "sync_queue"
+	ActionSetVolume   = "set_volume"
 )
 
 // Message is the base message structure
@@ -148,6 +149,8 @@ type PlaybackActionPayload struct {
 	InsertNext bool        `json:"insert_next,omitempty"`
 	Queue      []TrackInfo `json:"queue,omitempty"`
 	QueueTitle string      `json:"queue_title,omitempty"`
+	Volume     float64     `json:"volume"`
+	ServerTime int64       `json:"server_time,omitempty"`
 }
 
 // Suggestion payloads
@@ -223,6 +226,7 @@ type RoomState struct {
 	IsPlaying    bool        `json:"is_playing"`
 	Position     int64       `json:"position"`    // milliseconds
 	LastUpdate   int64       `json:"last_update"` // unix timestamp ms
+	Volume       float64     `json:"volume"`
 	Queue        []TrackInfo `json:"queue,omitempty"`
 }
 
@@ -257,6 +261,7 @@ type SyncStatePayload struct {
 	IsPlaying    bool       `json:"is_playing"`
 	Position     int64      `json:"position"`    // milliseconds
 	LastUpdate   int64      `json:"last_update"` // unix timestamp ms
+	Volume       float64    `json:"volume"`
 }
 
 // ReconnectPayload is for reconnecting to a room
@@ -1089,6 +1094,7 @@ func (s *Server) handleCreateRoom(c *Client, payload json.RawMessage) {
 			IsPlaying:  false,
 			Position:   0,
 			LastUpdate: time.Now().UnixMilli(),
+			Volume:     1.0,
 			Queue:      []TrackInfo{},
 		},
 	}
@@ -1365,6 +1371,7 @@ func (s *Server) handlePlaybackAction(c *Client, payload json.RawMessage) {
 	}
 
 	// Update room state based on action
+	prevLastUpdate := room.State.LastUpdate
 	room.State.LastUpdate = time.Now().UnixMilli()
 
 	switch p.Action {
@@ -1377,6 +1384,7 @@ func (s *Server) handlePlaybackAction(c *Client, payload json.RawMessage) {
 		}
 		room.State.IsPlaying = true
 		room.State.Position = p.Position
+		p.ServerTime = time.Now().UnixMilli()
 
 	case ActionPause:
 		// Pause is always allowed
@@ -1545,6 +1553,14 @@ func (s *Server) handlePlaybackAction(c *Client, payload json.RawMessage) {
 			// Pass sanitized queue back to payload for broadcast
 			p.Queue = sanitizedQueue
 		}
+
+	case ActionSetVolume:
+		if p.Volume < 0 || p.Volume > 1 {
+			c.sendError(s.logger, "invalid_volume", "Volume must be between 0 and 1")
+			return
+		}
+		room.State.Volume = p.Volume
+		room.State.LastUpdate = prevLastUpdate
 
 	default:
 		c.sendError(s.logger, "unknown_action", fmt.Sprintf("Unknown action: %s", p.Action))
@@ -1792,6 +1808,7 @@ func (s *Server) handleRequestSync(c *Client) {
 		IsPlaying:    responsePlaying,
 		Position:     currentPosition,
 		LastUpdate:   time.Now().UnixMilli(),
+		Volume:       room.State.Volume,
 	})
 }
 
